@@ -656,24 +656,27 @@ while( my $line = $annotated_vcf_fh->getline ) {
         } @all_effects;
 
  
-	# Find the highest priority effect with a gene symbol (usually the first one)
-	my ( $effect_with_gene_name ) = grep { $_->{SYMBOL} } @all_effects;
-	my $maf_gene = $effect_with_gene_name->{SYMBOL} if( $effect_with_gene_name );
-	if (defined $maf_gene){ #RNP fix for overlapping transcripts
+	    # Find the highest priority effect with a gene symbol (usually the first one)
+	    my ( $effect_with_gene_name ) = grep { $_->{SYMBOL} } @all_effects;
+	    my $maf_gene = $effect_with_gene_name->{SYMBOL} if( $effect_with_gene_name );
+	    if (defined $maf_gene){ #RNP fix for overlapping transcripts
         	if ($maf_gene eq "BIVM-ERCC5"){ $maf_gene = "ERCC5";}
-		elsif ($maf_gene eq "MEF2BNB-MEF2B"){ $maf_gene = "MEF2B";}
-	}
+		    elsif ($maf_gene eq "MEF2BNB-MEF2B"){ $maf_gene = "MEF2B";}
+	    }
  
-        # If the gene has user-defined custom isoform overrides, choose that instead
+        # If that gene has a user-preferred isoform, report the effect on that isoform
         ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{SYMBOL} eq $maf_gene and $_->{Transcript_ID} and $custom_enst{$_->{Transcript_ID}} } @all_effects;
 
-        # Find the effect on the canonical transcript of that highest priority gene
+        # If that gene has no user-preferred isoform, then use the VEP-preferred (canonical) isoform
         ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{SYMBOL} eq $maf_gene and $_->{CANONICAL} and $_->{CANONICAL} eq "YES" } @all_effects unless( $maf_effect );
 
-        # If that gene has no canonical transcript tagged, choose the highest priority canonical effect on any gene
-        ( $maf_effect ) = grep { $_->{CANONICAL} and $_->{CANONICAL} eq "YES" } @all_effects unless( $maf_effect );
+        # If that gene has no VEP-preferred isoform either, then choose the worst affected user-preferred isoform with a gene symbol
+        ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{Transcript_ID} and $custom_enst{$_->{Transcript_ID}} } @all_effects unless( $maf_effect );
 
-        # If none of the effects are tagged as canonical, then just report the top priority effect
+        # If none of the isoforms are user-preferred, then choose the worst affected VEP-preferred isoform with a gene symbol
+        ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{CANONICAL} and $_->{CANONICAL} eq "YES" } @all_effects unless( $maf_effect );
+
+        # If we still have nothing selected, then just report the worst effect
         $maf_effect = $all_effects[0] unless( $maf_effect );
     }
 
