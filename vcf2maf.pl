@@ -7,20 +7,24 @@ use warnings;
 use IO::File;
 use Getopt::Long qw( GetOptions );
 use Pod::Usage qw( pod2usage );
-use File::Copy qw( move );
 use File::Path qw( mkpath );
 use Config;
 
 # Set any default paths and constants
 my ( $tumor_id, $normal_id ) = ( "TUMOR", "NORMAL" );
-my ( $vep_path, $vep_data, $vep_forks, $buffer_size, $any_allele ) = ( "$ENV{HOME}/vep", "$ENV{HOME}/.vep", 4, 5000, 0 );
-my ( $ref_fasta, $filter_vcf ) = ( "$ENV{HOME}/.vep/homo_sapiens/91_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz", "$ENV{HOME}/.vep/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" );
-my ( $species, $ncbi_build, $cache_version, $maf_center, $retain_info, $min_hom_vaf, $max_filter_ac ) = ( "homo_sapiens", "GRCh37", "", ".", "", 0.7, 10 );
-my $perl_bin = $Config{perlpath};
+my ( $vep_path, $vep_data, $vep_forks, $buffer_size, $any_allele ) = ( "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86", 10, 10000, 0 );
+my ( $ref_fasta, $filter_vcf ) = ( "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/homo_sapiens_merged/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" );
+my ( $species, $ncbi_build, $cache_version, $maf_center, $retain_info, $min_hom_vaf, $max_filter_ac ) = ( "homo_sapiens_merged", "GRCh37", "", ".", "", 0.7, 10 );
+my $perl_bin = "/dmp/resources/prod/tools/system/perl/bin/perl";
 
 # Find out if samtools and tabix are properly installed, and warn the user if it's not
-my ( $samtools ) = map{chomp; $_}`which samtools`;
+#my ( $samtools ) = map{chomp; $_}`which samtools`;
+#( $samtools and -e $samtools ) or die "ERROR: Please install samtools, and make sure it's in your PATH\n";
+my $samtools = ( -e "/opt/bin/samtools" ? "/opt/bin/samtools" : "/dmp/resources/prod/tools/bio/samtools/production/samtools" );
+$samtools = `which samtools` unless( -e $samtools );
+chomp( $samtools );
 ( $samtools and -e $samtools ) or die "ERROR: Please install samtools, and make sure it's in your PATH\n";
+
 my ( $tabix ) = map{chomp; $_}`which tabix`;
 ( $tabix and -e $tabix ) or die "ERROR: Please install tabix, and make sure it's in your PATH\n";
 
@@ -47,7 +51,6 @@ sub GetEffectPriority {
         'disruptive_inframe_deletion' => 5, # An inframe decrease in cds length that deletes bases from the coding sequence starting within an existing codon
         'inframe_insertion' => 5, # An inframe non synonymous variant that inserts bases into the coding sequence
         'inframe_deletion' => 5, # An inframe non synonymous variant that deletes bases from the coding sequence
-        'protein_altering_variant' => 5, # A sequence variant which is predicted to change the protein encoded in the coding sequence
         'missense_variant' => 6, # A sequence variant, that changes one or more bases, resulting in a different amino acid sequence but where the length is preserved
         'conservative_missense_variant' => 6, # A sequence variant whereby at least one base of a codon is changed resulting in a codon that encodes for a different but similar amino acid. These variants may or may not be deleterious
         'rare_amino_acid_variant' => 6, # A sequence variant whereby at least one base of a codon encoding a rare amino acid is changed, resulting in a different encoded amino acid
@@ -56,6 +59,7 @@ sub GetEffectPriority {
         'stop_retained_variant' => 9, # A sequence variant where at least one base in the terminator codon is changed, but the terminator remains
         'synonymous_variant' => 9, # A sequence variant where there is no resulting change to the encoded amino acid
         'incomplete_terminal_codon_variant' => 10, # A sequence variant where at least one base of the final codon of an incompletely annotated transcript is changed
+        'protein_altering_variant' => 11, # A sequence variant which is predicted to change the protein encoded in the coding sequence
         'coding_sequence_variant' => 11, # A sequence variant that changes the coding sequence
         'mature_miRNA_variant' => 11, # A transcript variant located with the sequence of the mature miRNA
         'exon_variant' => 11, # A sequence variant that changes exon sequence
@@ -222,7 +226,7 @@ pod2usage( -verbose => 1, -input => \*DATA, -exitval => 0 ) if( $help );
 pod2usage( -verbose => 2, -input => \*DATA, -exitval => 0 ) if( $man );
 
 # Check if required arguments are missing or problematic
-( defined $input_vcf and defined $output_maf ) or die "ERROR: Both input-vcf and output-maf must be defined!\n";
+( defined $input_vcf ) or die "ERROR: --input-vcf must be defined!\n";
 ( -s $input_vcf ) or die "ERROR: Provided --input-vcf is missing or empty: $input_vcf\n";
 ( -s $ref_fasta ) or die "ERROR: Provided --ref-fasta is missing or empty: $ref_fasta\n";
 ( $input_vcf !~ m/\.(gz|bz2|bcf)$/ ) or die "ERROR: Unfortunately, --input-vcf cannot be in a compressed format\n";
@@ -251,66 +255,18 @@ else {
 my $input_name = substr( $input_vcf, rindex( $input_vcf, "/" ) + 1 );
 $input_name =~ s/(\.vcf)*$//;
 
-# If the VCF contains SVs, split the breakpoints into separate lines before passing to VEP
-my $split_svs = 0;
-my $orig_vcf_fh = IO::File->new( $input_vcf ) or die "ERROR: Couldn't open --input-vcf: $input_vcf!\n";
-my $split_vcf_fh = IO::File->new( "$tmp_dir/$input_name.split.vcf", "w" ) or die "ERROR: Couldn't open VCF: $tmp_dir/$input_name.split.vcf!\n";
-while( my $line = $orig_vcf_fh->getline ) {
-    # If the file uses Mac OS 9 newlines, quit with an error
-    ( $line !~ m/\r$/ ) or die "ERROR: Your VCF uses CR line breaks, which we can't support. Please use LF or CRLF.\n";
-
-    if( $line =~ m/^#/ ) {
-        $split_vcf_fh->print( $line ); # Write header lines unchanged
-        next;
-    }
-
-    chomp( $line );
-    my @cols = split( "\t", $line );
-    my %info = map {( m/=/ ? ( split( /=/, $_, 2 )) : ( $_, "1" ))} split( /\;/, $cols[7] );
-    if( $info{SVTYPE} ){
-        # Remove SVTYPE tag if REF/ALT alleles are defined, or VEP won't report transcript effects
-        if( $cols[3]=~m/^[ACGTN]+$/i and $cols[4]=~m/^[ACGTN,]+$/i ) {
-            $cols[7]=~s/(SVTYPE=\w+;|;SVTYPE=\w+|SVTYPE=\w+)//;
-            $split_vcf_fh->print( join( "\t", @cols ), "\n" );
-        }
-        # For legit SVs except insertions, split them into two separate breakpoint events
-        elsif( $info{SVTYPE}=~m/^(BND|TRA|DEL|DUP|INV)$/ ) {
-            $split_svs = 1;
-            # Don't tell VEP it's an SV, by removing the SVTYPE tag
-            $cols[7]=~s/(SVTYPE=\w+;|;SVTYPE=\w+|SVTYPE=\w+)//;
-            # Rename two SV specific INFO keys to something friendlier
-            $cols[7]=~s/CT=([35]to[35])/Frame=$1/;
-            $cols[7]=~s/SVMETHOD=([\w.]+)/Method=$1/;
-            $cols[4] = "<" . $info{SVTYPE} . ">";
-            # Fetch the REF allele at the second breakpoint using samtools faidx
-            my $ref2 = `$samtools faidx $ref_fasta $info{CHR2}:$info{END}-$info{END} | grep -v ^\\>`;
-            chomp( $ref2 );
-            $split_vcf_fh->print( join( "\t", $info{CHR2}, $info{END}, $cols[2], ( $ref2 ? $ref2 : $cols[3] ), @cols[4..$#cols] ), "\n" );
-            $split_vcf_fh->print( join( "\t", @cols ), "\n" );
-        }
-        $input_vcf = "$tmp_dir/$input_name.split.vcf";
-    }
-    else {
-        $split_vcf_fh->print( join( "\t", @cols ), "\n" );
-    }
-}
-$split_vcf_fh->close;
-$orig_vcf_fh->close;
-
-# Delete the split.vcf created above if we didn't find any variants with the SVTYPE tag
-unlink( "$tmp_dir/$input_name.split.vcf" ) if( $input_vcf ne "$tmp_dir/$input_name.split.vcf" );
-
-# If a liftOver chain was provided, remap and switch the input VCF before annotation
-my ( %remap );
+# If a liftOver chain was provided, remap and replace the input VCF before annotation
+my ( %remap, %remap_back );
 if( $remap_chain ) {
     # Find out if liftOver is properly installed, and warn the user if it's not
     my $liftover = `which liftOver`;
     chomp( $liftover );
     ( $liftover and -e $liftover ) or die "ERROR: Please install liftOver, and make sure it's in your PATH\n";
 
-    # Make a BED file from the VCF, run liftOver on it, and create a hash mapping old to new loci
+    # Create a temporary folder where we can dump the intermediate files before/after liftOver
     `grep -v ^# $input_vcf | cut -f1,2 | awk '{OFS="\\t"; print \$1,\$2-1,\$2,\$1":"\$2}' > $tmp_dir/$input_name.bed`;
     %remap = map{chomp; my @c=split("\t"); ($c[3], "$c[0]:$c[2]")}`$liftover $tmp_dir/$input_name.bed $remap_chain /dev/stdout /dev/null 2> /dev/null`;
+    %remap_back = reverse %remap; # This is for restoring original loci in the annotated VCF
     unlink( "$tmp_dir/$input_name.bed" );
 
     # Create a new VCF in the temp folder, with remapped loci on which we'll run annotation
@@ -325,8 +281,6 @@ if( $remap_chain ) {
             my @cols = split( "\t", $line );
             my $locus = $cols[0] . ":" . $cols[1];
             if( defined $remap{$locus} ) {
-                # Retain original variant under INFO, so we can append it later to the output MAF
-                $cols[7] = ( !$cols[7] or $cols[7] eq "." ? "" : "$cols[7];" ) . "REMAPPED_POS=" . join( ":", @cols[0,1,3,4] );
                 @cols[0,1] = split( ":", $remap{$locus} );
                 $remap_vcf_fh->print( join( "\t", @cols ), "\n" );
             }
@@ -359,11 +313,11 @@ while( my $line = $vcf_fh->getline ) {
 $vcf_fh->close;
 
 # samtools runs faster when passed many loci at a time, but limited to around 125k args, at least
-# on CentOS 6. If there are too many loci, split them into smaller chunks and run separately
+# on CentOS 6. If there are too many loci, split them into 50k chunks and run separately
 my ( $lines, @regions_split ) = ( "", ());
 my @regions = keys %uniq_regions;
 my $chr_prefix_in_use = ( @regions and $regions[0] =~ m/^chr/ ? 1 : 0 );
-push( @regions_split, [ splice( @regions, 0, $buffer_size ) ] ) while @regions;
+push( @regions_split, [ splice( @regions, 0, 50000 ) ] ) while @regions;
 map{ my $region = join( " ", @{$_} ); $lines .= `$samtools faidx $ref_fasta $region` } @regions_split;
 foreach my $line ( grep( length, split( ">", $lines ))) {
     # Carefully split this FASTA entry, properly chomping newlines for long indels
@@ -381,17 +335,17 @@ foreach my $line ( grep( length, split( ">", $lines ))) {
 ( !@regions or %flanking_bps ) or die "ERROR: You're either using an outdated samtools, or --ref-fasta is not the same genome build as your --input-vcf.";
 
 # Skip filtering if not handling GRCh37, and filter-vcf is pointing to the default GRCh37 ExAC VCF
-if(( $species eq "homo_sapiens" and $ncbi_build eq "GRCh37" and $filter_vcf ) or ( $filter_vcf and $filter_vcf ne "$ENV{HOME}/.vep/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" )) {
-    ( -s $filter_vcf ) or die "ERROR: Provided --filter-vcf is missing or empty: $filter_vcf\n";
+if( $ncbi_build eq "GRCh37" or ( $filter_vcf and $filter_vcf ne "$ENV{HOME}/.vep/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" )) {
+    ( $filter_vcf and -s $filter_vcf ) or die "ERROR: Provided --filter-vcf is missing or empty: $filter_vcf\n";
     # Query each variant locus on the filter VCF, using tabix, just like we used samtools earlier
     ( $lines, @regions_split ) = ( "", ());
     my @regions = keys %uniq_loci;
-    push( @regions_split, [ splice( @regions, 0, $buffer_size ) ] ) while @regions;
+    push( @regions_split, [ splice( @regions, 0, 50000 ) ] ) while @regions;
     # ::NOTE:: chr-prefix removal works safely here because ExAC is limited to 1..22, X, Y
     map{ my $loci = join( " ", map{s/^chr//; $_} @{$_} ); $lines .= `$tabix $filter_vcf $loci` } @regions_split;
     foreach my $line ( split( "\n", $lines )) {
         my ( $chr, $pos, undef, $ref, $alt, undef, $filter, $info_line ) = split( "\t", $line );
-        # Parse out data from info column, and store it for later, along with REF, ALT, and FILTER
+        # Parse out data in the info column, and store it for later, along with REF, ALT, and FILTER
         my $locus = ( $chr_prefix_in_use ? "chr$chr:$pos" : "$chr:$pos" );
         %{$filter_data{$locus}} = map {( m/=/ ? ( split( /=/, $_, 2 )) : ( $_, "1" ))} split( /\;/, $info_line );
         $filter_data{$locus}{REF} = $ref;
@@ -422,23 +376,19 @@ my $output_vcf = ( $remap_chain ? "$tmp_dir/$input_name.remap.vep.vcf" : "$tmp_d
 # Skip running VEP if an annotated VCF already exists
 unless( -s $output_vcf ) {
     warn "STATUS: Running VEP and writing to: $output_vcf\n";
-    # Make sure we can find the VEP script
-    my $vep_script = ( -s "$vep_path/vep" ? "$vep_path/vep" : "$vep_path/variant_effect_predictor.pl" );
-    ( -s $vep_script ) or die "ERROR: Cannot find VEP script in path: $vep_path\n";
+    # Make sure we can find the VEP script and the reference FASTA
+    ( -s "$vep_path/variant_effect_predictor.pl" ) or die "ERROR: Cannot find VEP script variant_effect_predictor.pl in path: $vep_path\n";
 
     # Contruct VEP command using some default options and run it
-    my $vep_cmd = "$perl_bin $vep_script --species $species --assembly $ncbi_build --offline --no_progress --no_stats --buffer_size $buffer_size --sift b --ccds --uniprot --hgvs --symbol --numbers --domains --gene_phenotype --canonical --protein --biotype --uniprot --tsl --pubmed --variant_class --shift_hgvs 1 --check_existing --total_length --allele_number --no_escape --xref_refseq --failed 1 --vcf --flag_pick_allele --pick_order canonical,tsl,biotype,rank,ccds,length --dir $vep_data --fasta $ref_fasta --format vcf --input_file $input_vcf --output_file $output_vcf";
+    my $vep_cmd = "$perl_bin $vep_path/variant_effect_predictor.pl --species $species --assembly $ncbi_build --offline --no_progress --no_stats --buffer_size $buffer_size --sift b --ccds --uniprot --hgvs --symbol --numbers --domains --gene_phenotype --canonical --protein --biotype --uniprot --tsl --pubmed --variant_class --shift_hgvs 1 --check_existing --total_length --allele_number --no_escape --xref_refseq --failed 1 --vcf --minimal --flag_pick_allele --pick_order canonical,tsl,biotype,rank,ccds,length --dir $vep_data --fasta $ref_fasta --format vcf --input_file $input_vcf --output_file $output_vcf";
     # VEP barks if --fork is set to 1. So don't use this argument unless it's >1
     $vep_cmd .= " --fork $vep_forks" if( $vep_forks > 1 );
-    # Require allele match for co-located variants unless user-rejected or we're using a newer VEP
-    $vep_cmd .= " --check_allele" unless( $any_allele or $vep_script =~ m/vep$/ );
+    # Unless user says otherwise, require VEP to match alleles when reporting co-located variants
+    $vep_cmd .= " --check_allele" unless( $any_allele );
     # Add --cache-version only if the user specifically asked for a version
     $vep_cmd .= " --cache_version $cache_version" if( $cache_version );
     # Add options that only work on human variants
-    if( $species eq "homo_sapiens" ) {
-        # Slight change in these arguments if using the newer VEP
-        $vep_cmd .= " --polyphen b " . ( $vep_script =~ m/vep$/ ? "--af --af_1kg --af_esp --af_gnomad" : "--gmaf --maf_1kg --maf_esp" );
-    }
+    $vep_cmd .= " --polyphen b --gmaf --maf_1kg --maf_esp" if( $species eq "homo_sapiens" );
     # Add options that work for most species, except a few we know about
     $vep_cmd .= " --regulatory" unless( $species eq "canis_familiaris" );
 
@@ -463,27 +413,22 @@ my @maf_header = qw(
 my @ann_cols = qw( Allele Gene Feature Feature_type Consequence cDNA_position CDS_position
     Protein_position Amino_acids Codons Existing_variation ALLELE_NUM DISTANCE STRAND_VEP SYMBOL
     SYMBOL_SOURCE HGNC_ID BIOTYPE CANONICAL CCDS ENSP SWISSPROT TREMBL UNIPARC RefSeq SIFT PolyPhen
-    EXON INTRON DOMAINS AF AFR_AF AMR_AF ASN_AF EAS_AF EUR_AF SAS_AF AA_AF EA_AF CLIN_SIG SOMATIC
-    PUBMED MOTIF_NAME MOTIF_POS HIGH_INF_POS MOTIF_SCORE_CHANGE IMPACT PICK VARIANT_CLASS TSL
-    HGVS_OFFSET PHENO MINIMISED ExAC_AF ExAC_AF_AFR ExAC_AF_AMR ExAC_AF_EAS ExAC_AF_FIN ExAC_AF_NFE
-    ExAC_AF_OTH ExAC_AF_SAS GENE_PHENO FILTER flanking_bps variant_id variant_qual ExAC_AF_Adj
-    ExAC_AC_AN_Adj ExAC_AC_AN ExAC_AC_AN_AFR ExAC_AC_AN_AMR ExAC_AC_AN_EAS ExAC_AC_AN_FIN
-    ExAC_AC_AN_NFE ExAC_AC_AN_OTH ExAC_AC_AN_SAS ExAC_FILTER gnomAD_AF gnomAD_AFR_AF gnomAD_AMR_AF
-    gnomAD_ASJ_AF gnomAD_EAS_AF gnomAD_FIN_AF gnomAD_NFE_AF gnomAD_OTH_AF gnomAD_SAS_AF );
+    EXON INTRON DOMAINS GMAF AFR_MAF AMR_MAF ASN_MAF EAS_MAF EUR_MAF SAS_MAF AA_MAF EA_MAF CLIN_SIG
+    SOMATIC PUBMED MOTIF_NAME MOTIF_POS HIGH_INF_POS MOTIF_SCORE_CHANGE IMPACT PICK VARIANT_CLASS
+    TSL HGVS_OFFSET PHENO MINIMISED ExAC_AF ExAC_AF_AFR ExAC_AF_AMR ExAC_AF_EAS ExAC_AF_FIN
+    ExAC_AF_NFE ExAC_AF_OTH ExAC_AF_SAS GENE_PHENO FILTER flanking_bps variant_id variant_qual
+    ExAC_AF_Adj ExAC_AC_AN_Adj ExAC_AC_AN ExAC_AC_AN_AFR ExAC_AC_AN_AMR ExAC_AC_AN_EAS
+    ExAC_AC_AN_FIN ExAC_AC_AN_NFE ExAC_AC_AN_OTH ExAC_AC_AN_SAS ExAC_FILTER );
 
 my @ann_cols_format; # To store the actual order of VEP data, that may differ between runs
 push( @maf_header, @ann_cols );
 
 # If the user has INFO fields they want to retain, create additional columns for those
 my @addl_info_cols = ();
-if( $retain_info or $remap_chain or $split_svs ) {
+if( $retain_info ) {
     # But let's not overwrite existing columns with the same name
     my %maf_cols = map{ my $c = lc; ( $c, 1 )} @maf_header;
     @addl_info_cols = grep{ my $c = lc; !$maf_cols{$c}} split( ",", $retain_info );
-    # If a remap-chain was used, add a column to retain the original chr:pos:ref:alt
-    push( @addl_info_cols, "REMAPPED_POS" ) if( $remap_chain );
-    # If we had to split some SVs earlier, add some columns with some useful info about SVs
-    push( @addl_info_cols, qw( Fusion Method Frame CONSENSUS )) if( $split_svs );
     push( @maf_header, @addl_info_cols );
 }
 
@@ -499,11 +444,12 @@ if( -s $entrez_id_file ) {
 
 # Parse through each variant in the annotated VCF, pull out CSQ/ANN from the INFO column, and choose
 # one transcript per variant whose annotation will be used in the MAF
-my $maf_fh = IO::File->new( $output_maf, ">" ) or die "ERROR: Couldn't open --output-maf: $output_maf!\n";
+my $maf_fh = *STDOUT; # Use STDOUT if an output MAF file was not defined
+$maf_fh = IO::File->new( $output_maf, ">" ) or die "ERROR: Couldn't open --output-maf: $output_maf!\n" if( $output_maf );
 $maf_fh->print( "#version 2.4\n" . join( "\t", @maf_header ), "\n" ); # Print MAF header
 ( -s $output_vcf ) or exit; # Warnings on this were printed earlier, but quit here, only after a blank MAF is created
 my $annotated_vcf_fh = IO::File->new( $output_vcf ) or die "ERROR: Couldn't open annotated VCF: $output_vcf!\n";
-my ( $vcf_tumor_idx, $vcf_normal_idx, %sv_pair );
+my ( $vcf_tumor_idx, $vcf_normal_idx );
 while( my $line = $annotated_vcf_fh->getline ) {
 
     # Parse out the VEP CSQ/ANN format, which seems to differ between runs
@@ -538,20 +484,11 @@ while( my $line = $annotated_vcf_fh->getline ) {
     # Parse out the data in the info column, and store into a hash
     my %info = map {( m/=/ ? ( split( /=/, $_, 2 )) : ( $_, "1" ))} split( /\;/, $info_line );
 
-    # By default, the variant allele is the first (usually the only) allele listed under ALT. If
-    # there are >1 alleles in ALT, choose the first non-REF allele listed under tumor GT, that is
-    # also not seen under normal GT. If tumor GT is undefined or ambiguous, choose the tumor allele
-    # with the most supporting read depth, if available.
+    # By default, the variant allele is the first (usually the only) allele listed under ALT
+    # If there are multiple ALT alleles, choose the allele specified in the tumor GT field
+    # If tumor GT is undefined or ambiguous, choose the one with the most supporting read depth
     my @alleles = ( $ref, split( /,/, $alt ));
     my $var_allele_idx = 1;
-
-    # Parse out info from the normal genotype field
-    my ( %nrm_info, @nrm_depths );
-    if( defined $vcf_normal_idx ) {
-        my @format_keys = split( /\:/, $format_line );
-        my $idx = 0;
-        %nrm_info = map {( $format_keys[$idx++], $_ )} split( /\:/, $rest[$vcf_normal_idx] );
-    }
 
     # Parse out info from the tumor genotype field
     my ( %tum_info, @tum_depths );
@@ -562,14 +499,9 @@ while( my $line = $annotated_vcf_fh->getline ) {
 
         # If possible, parse the tumor genotype to identify the variant allele
         if( defined $tum_info{GT} and $tum_info{GT} ne "." and $tum_info{GT} ne "./." ) {
-            my @tum_gt = split( /[\/|]/, $tum_info{GT} );
-            # Default to the first non-REF allele seen in tumor GT
-            ( $var_allele_idx ) = grep {$_ ne "0"} @tum_gt;
-            # If possible, choose the first non-REF tumor allele that is also not in normal GT
-            if( defined $nrm_info{GT} and $nrm_info{GT} ne "." and $nrm_info{GT} ne "./." ) {
-                my %nrm_gt = map {( $_, 1 )} split( /[\/|]/, $nrm_info{GT} );
-                ( $var_allele_idx ) = grep {$_ ne "0" and !$nrm_gt{$_}} @tum_gt;
-            }
+            my @genotype = split( /[\/|]/, $tum_info{GT} );
+            # In case of polyploid calls, choose the first non-REF allele, if any
+            ( $var_allele_idx ) = grep {$_ ne "0"} @genotype;
             # If GT was unhelpful, default to the first ALT allele and set GT to undefined
             if( !defined $var_allele_idx or $var_allele_idx !~ m/^\d+$/ or $var_allele_idx >= scalar( @alleles )) {
                 $var_allele_idx = 1;
@@ -577,7 +509,7 @@ while( my $line = $annotated_vcf_fh->getline ) {
             }
         }
 
-        # Standardize tumor AD and DP based on data in the genotype fields
+        # Standardize AD and DP based on data in the genotype fields
         FixAlleleDepths( \@alleles, $var_allele_idx, \%tum_info );
         @tum_depths = split( ",", $tum_info{AD} );
 
@@ -598,8 +530,14 @@ while( my $line = $annotated_vcf_fh->getline ) {
     # Set the variant allele to whatever we selected above
     my $var = $alleles[$var_allele_idx];
 
-    # Standardize normal AD and DP based on data in the genotype fields
+    # Same as above, parse out info from the normal genotype field
+    my ( %nrm_info, @nrm_depths );
     if( defined $vcf_normal_idx ) {
+        my @format_keys = split( /\:/, $format_line );
+        my $idx = 0;
+        %nrm_info = map {( $format_keys[$idx++], $_ )} split( /\:/, $rest[$vcf_normal_idx] );
+
+        # Standardize AD and DP based on data in the genotype fields
         FixAlleleDepths( \@alleles, $var_allele_idx, \%nrm_info );
         @nrm_depths = split( ",", $nrm_info{AD} );
         $nrm_info{GT} = "./." unless( defined $nrm_info{GT} and $nrm_info{GT} ne '.' );
@@ -655,9 +593,8 @@ while( my $line = $annotated_vcf_fh->getline ) {
             # Remove the prefixed HGVSc code in HGVSp, if found
             $effect{HGVSp} =~ s/^.*\((p\.\S+)\)/$1/ if( $effect{HGVSp} and $effect{HGVSp} =~ m/^c\./ );
 
-            # Sort consequences by decreasing order of severity, and pick the most severe one
-            $effect{Consequence} = join( ",", sort { GetEffectPriority($a) <=> GetEffectPriority($b) } split( ",", $effect{Consequence} ));
-            ( $effect{One_Consequence} ) = split( ",", $effect{Consequence} );
+            # If there are several consequences listed for a transcript, choose the most severe one
+            ( $effect{One_Consequence} ) = sort { GetEffectPriority($a) <=> GetEffectPriority($b) } split( ",", $effect{Consequence} );
 
             # When VEP fails to provide any value in Consequence, tag it as an intergenic variant
             $effect{One_Consequence} = "intergenic_variant" unless( $effect{Consequence} );
@@ -687,19 +624,13 @@ while( my $line = $annotated_vcf_fh->getline ) {
             if( defined $effect{HGVSp_Short} and $effect{HGVSp_Short} eq "p.=" ) {
                 my ( $p_pos ) = $effect{Protein_position} =~ m/^(\d+)(-\d+)?\/\d+$/;
                 my $aa = $effect{Amino_acids};
-                $effect{HGVSp_Short} = "p.$aa" . $p_pos . "=";
+                $effect{HGVSp_Short} = "p.$aa" . $p_pos . $aa;
             }
 
             # Copy VEP data into MAF fields that don't share the same identifier
             $effect{Transcript_ID} = $effect{Feature};
             $effect{Exon_Number} = $effect{EXON};
             $effect{Hugo_Symbol} = ( $effect{SYMBOL} ? $effect{SYMBOL} : '' );
-
-            # If AF columns from the older VEP are found, rename to the newer ones for consistency
-            my %af_col = qw( GMAF AF AFR_MAF AFR_AF AMR_MAF AMR_AF ASN_MAF ASN_AF EAS_MAF EAS_AF
-                EUR_MAF EUR_AF SAS_MAF SAS_AF AA_MAF AA_AF EA_MAF EA_AF );
-            map { $effect{$af_col{$_}} = $effect{$_} if( defined $effect{$_} )} keys %af_col;
-
             # If VEP couldn't find this variant in dbSNP/COSMIC/etc., we'll say it's "novel"
             if( $effect{Existing_variation} ) {
                 # ::NOTE:: If seen in a DB other than dbSNP, this field will remain blank
@@ -724,20 +655,28 @@ while( my $line = $annotated_vcf_fh->getline ) {
             $b->{Transcript_Length} <=> $a->{Transcript_Length}
         } @all_effects;
 
-        # Find the highest priority effect with a gene symbol (usually the first one)
-        my ( $effect_with_gene_name ) = grep { $_->{SYMBOL} } @all_effects;
-        my $maf_gene = $effect_with_gene_name->{SYMBOL} if( $effect_with_gene_name );
-
-        # If the gene has user-defined custom isoform overrides, choose that instead
+ 
+	    # Find the highest priority effect with a gene symbol (usually the first one)
+	    my ( $effect_with_gene_name ) = grep { $_->{SYMBOL} } @all_effects;
+	    my $maf_gene = $effect_with_gene_name->{SYMBOL} if( $effect_with_gene_name );
+	    if (defined $maf_gene){ #RNP fix for overlapping transcripts
+        	if ($maf_gene eq "BIVM-ERCC5"){ $maf_gene = "ERCC5";}
+		    elsif ($maf_gene eq "MEF2BNB-MEF2B"){ $maf_gene = "MEF2B";}
+	    }
+ 
+        # If that gene has a user-preferred isoform, report the effect on that isoform
         ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{SYMBOL} eq $maf_gene and $_->{Transcript_ID} and $custom_enst{$_->{Transcript_ID}} } @all_effects;
 
-        # Find the effect on the canonical transcript of that highest priority gene
+        # If that gene has no user-preferred isoform, then use the VEP-preferred (canonical) isoform
         ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{SYMBOL} eq $maf_gene and $_->{CANONICAL} and $_->{CANONICAL} eq "YES" } @all_effects unless( $maf_effect );
 
-        # If that gene has no canonical transcript tagged, choose the highest priority canonical effect on any gene
-        ( $maf_effect ) = grep { $_->{CANONICAL} and $_->{CANONICAL} eq "YES" } @all_effects unless( $maf_effect );
+        # If that gene has no VEP-preferred isoform either, then choose the worst affected user-preferred isoform with a gene symbol
+        ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{Transcript_ID} and $custom_enst{$_->{Transcript_ID}} } @all_effects unless( $maf_effect );
 
-        # If none of the effects are tagged as canonical, then just report the top priority effect
+        # If none of the isoforms are user-preferred, then choose the worst affected VEP-preferred isoform with a gene symbol
+        ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{CANONICAL} and $_->{CANONICAL} eq "YES" } @all_effects unless( $maf_effect );
+
+        # If we still have nothing selected, then just report the worst effect
         $maf_effect = $all_effects[0] unless( $maf_effect );
     }
 
@@ -763,7 +702,7 @@ while( my $line = $annotated_vcf_fh->getline ) {
         # ::NOTE:: MAF only supports biallelic sites. Tumor_Seq_Allele2 must always be the $var
         # picked earlier. For Tumor_Seq_Allele1, pick the first non-var allele in GT (usually $ref)
         my ( $idx1, $idx2 ) = split( /[\/|]/, $tum_info{GT} );
-        # If GT was monoploid, then $idx2 will be undefined, and we should set it equal to $idx1
+        # If GT was monoploid, then $idx2 will undefined, and we should set it equal to $idx1
         $idx2 = $idx1 unless( defined $idx2 );
         $maf_line{Tumor_Seq_Allele1} = ( $alleles[$idx1] ne $var ? $alleles[$idx1] : $alleles[$idx2] );
     }
@@ -773,7 +712,7 @@ while( my $line = $annotated_vcf_fh->getline ) {
     if( defined $nrm_info{GT} and $nrm_info{GT} ne "." and $nrm_info{GT} ne "./." ) {
         # ::NOTE:: MAF only supports biallelic sites. So choose the first two alleles listed in GT
         my ( $idx1, $idx2 ) = split( /[\/|]/, $nrm_info{GT} );
-        # If GT was monoploid, then $idx2 will be undefined, and we should set it equal to $idx1
+        # If GT was monoploid, then $idx2 will undefined, and we should set it equal to $idx1
         $idx2 = $idx1 unless( defined $idx2 );
         $maf_line{Match_Norm_Seq_Allele1} = $alleles[$idx1];
         $maf_line{Match_Norm_Seq_Allele2} = $alleles[$idx2];
@@ -790,10 +729,15 @@ while( my $line = $annotated_vcf_fh->getline ) {
     foreach my $effect ( @all_effects ) {
         my $gene_name = $effect->{Hugo_Symbol};
         my $effect_type = $effect->{One_Consequence};
-        my $protein_change = ( $effect->{HGVSp} ? $effect->{HGVSp} : '' );
-        my $transcript_id = ( $effect->{Transcript_ID} ? $effect->{Transcript_ID} : '' );
+        my $cDNA_change  = ( $effect->{HGVSc} ? $effect->{HGVSc} : '' );   #ADDED RNP
+	my $protein_change_long = ( $effect->{HGVSp} ? $effect->{HGVSp} : '' ); #ADDED RNP
+  	my $protein_change = ( $effect->{HGVSp_Short} ? $effect->{HGVSp_Short} : '' );
+ 	my $transcript_id = ( $effect->{Transcript_ID} ? $effect->{Transcript_ID} : '' );
         my $refseq_ids = ( $effect->{RefSeq} ? $effect->{RefSeq} : '' );
-        $maf_line{all_effects} .= "$gene_name,$effect_type,$protein_change,$transcript_id,$refseq_ids;" if( $effect_type and $transcript_id );
+       # $maf_line{all_effects} .= "$gene_name,$effect_type,$protein_change,$transcript_id,$refseq_ids;" if( $gene_name and $effect_type and $transcript_id );
+	my $exon_number = $effect->{Exon_Number}; #ADDED
+        $maf_line{all_effects} .= "$gene_name,$effect_type,$cDNA_change,$protein_change,$transcript_id,$refseq_ids,$exon_number,$protein_change_long;" if( $gene_name and $effect_type and $transcript_id );
+
     }
 
     # If this variant was seen in the ExAC VCF, let's report allele counts and frequencies
@@ -836,7 +780,7 @@ while( my $line = $annotated_vcf_fh->getline ) {
     # Copy FILTER from input VCF, and tag calls with high allele counts in any ExAC subpopulation
     my $subpop_count = 0;
     # Remove existing common_variant tags from input, so it's redefined by our criteria here
-    $filter = join( ";", grep{ $_ ne "common_variant" } split( /,|;/, $filter ));
+    $filter = join( ",", grep{ $_ ne "common_variant" } split( ",", $filter ));
     foreach my $subpop ( qw( AFR AMR EAS FIN NFE OTH SAS )) {
         if( $maf_line{"ExAC_AC_AN_$subpop"} ) {
             my ( $subpop_ac ) = split( "/", $maf_line{"ExAC_AC_AN_$subpop"} );
@@ -844,7 +788,7 @@ while( my $line = $annotated_vcf_fh->getline ) {
         }
     }
     if( $subpop_count > 0 ) {
-        $filter = (( $filter eq "PASS" or $filter eq "." or !$filter ) ? "common_variant" : "$filter;common_variant" );
+        $filter = (( $filter eq "PASS" or $filter eq "." or !$filter ) ? "common_variant" : "$filter,common_variant" );
     }
     $maf_line{FILTER} = $filter;
 
@@ -858,60 +802,14 @@ while( my $line = $annotated_vcf_fh->getline ) {
 
     # If there are additional INFO data to add, then add those
     foreach my $info_col ( @addl_info_cols ) {
-        $maf_line{$info_col} = ( defined $info{$info_col} ? $info{$info_col} : "" );
-    }
-
-    # If this is an SV, pair up gene names from separate lines to backfill the Fusion column later
-    if( $split_svs and $var=~m/^<BND|DEL|DUP|INV>$/ ) {
-        my $sv_key = "$var_id-$tumor_id";
-        if( $sv_pair{$sv_key} ) {
-            $sv_pair{$sv_key} = $sv_pair{$sv_key} . "-" . $maf_line{Hugo_Symbol} . " fusion";
-        }
-        else {
-            $sv_pair{$sv_key} = $maf_line{Hugo_Symbol};
-        }
+        $maf_line{$info_col} = ( $info{$info_col} ? $info{$info_col} : "" );
     }
 
     # At this point, we've generated all we can about this variant, so write it to the MAF
     $maf_fh->print( join( "\t", map{( defined $maf_line{$_} ? $maf_line{$_} : "" )} @maf_header ) . "\n" );
 }
-$maf_fh->close;
+$maf_fh->close if( $output_maf );
 $annotated_vcf_fh->close;
-
-# If the MAF lists SVs, backfill the Fusion column with gene-pair names
-if( $split_svs ) {
-    my $output_name = substr( $output_maf, rindex( $output_maf, "/" ) + 1 );
-    $output_name =~ s/(\.maf)*$//;
-    my $tmp_output_maf = "$tmp_dir/$output_name.tmp.maf";
-
-    my $in_maf_fh = IO::File->new( $output_maf ) or die "ERROR: Couldn't open: $output_maf!\n";
-    my $out_maf_fh = IO::File->new( $tmp_output_maf, ">" ) or die "ERROR: Couldn't open: $tmp_output_maf!\n";
-    my ( $tid_idx, $fusion_idx, $var_id_idx ) = ( 0, 0, 0 );
-    while( my $line = $in_maf_fh->getline ) {
-        chomp( $line );
-        if( $line =~ m/^#/ ) {
-            $out_maf_fh->print( "$line\n" ); # Copy comments unchanged
-        }
-        elsif( $line =~ m/^Hugo_Symbol/ ) {
-            # Copy the header unchanged, after figuring out necessary column indexes
-            foreach( split( /\t/, $line )) { last if( $_ eq "Tumor_Sample_Barcode" ); ++$tid_idx; }
-            foreach( split( /\t/, $line )) { last if( $_ eq "Fusion" ); ++$fusion_idx; }
-            foreach( split( /\t/, $line )) { last if( $_ eq "variant_id" ); ++$var_id_idx; }
-            $out_maf_fh->print( "$line\n" ); # Copy header unchanged
-        }
-        else {
-            # Write the gene-pair name into the Fusion column if it was backfilled earlier
-            my @cols = split( /\t/, $line, -1 );
-            my $sv_key = $cols[$var_id_idx] . "-" . $cols[$tid_idx];
-            $cols[$fusion_idx] = $sv_pair{$sv_key} if( $sv_pair{$sv_key} );
-            $out_maf_fh->print( join( "\t", @cols ) . "\n" );
-        }
-    }
-    $out_maf_fh->close;
-    $in_maf_fh->close;
-
-    move( $tmp_output_maf, $output_maf );
-}
 
 # Converts Sequence Ontology variant types to MAF variant classifications
 sub GetVariantClassification {
@@ -972,9 +870,10 @@ sub FixAlleleDepths {
 
         # If the only ALT allele is N, then set it to the allele with the highest non-ref readcount
         if( scalar( @alleles ) == 2 and $alleles[1] eq "N" ) {
+            $var_allele_idx = 1;
             my %acgt_depths = map{( defined $fmt_info{$_.'U'} ? ( $_, $fmt_info{$_.'U'} ) : ( $_, "" ))} qw( A C G T );
             my @deepest = sort {$acgt_depths{$b} <=> $acgt_depths{$a}} keys %acgt_depths;
-            ( $alleles[1] ) = ( $deepest[0] ne $alleles[0] ? $deepest[0] : $deepest[1] );
+            ( $alleles[$var_allele_idx] ) = ( $deepest[0] ne $alleles[0] ? $deepest[0] : $deepest[1] );
         }
         @depths = map{( defined $fmt_info{$_.'U'} ? $fmt_info{$_.'U'} : "" )} @alleles;
     }
@@ -983,29 +882,9 @@ sub FixAlleleDepths {
         # Reference allele depth is not provided by Strelka for indels, so we have to skip it
         @depths = ( "", ( split /,/, $fmt_info{TIR} )[0] );
     }
-    # Handle VCF lines by CaVEMan, where allele depths are in FAZ:FCZ:FGZ:FTZ:RAZ:RCZ:RGZ:RTZ
-    elsif( !defined $fmt_info{AD} and scalar( grep{defined $fmt_info{$_}} qw/FAZ FCZ FGZ FTZ RAZ RCZ RGZ RTZ/ ) == 8 ) {
-        # Create tags for forward+reverse strand reads, and use those to determine REF/ALT depths
-        map{ $fmt_info{$_} = $fmt_info{'F'.$_} + $fmt_info{'R'.$_} } qw( AZ CZ GZ TZ );
-        @depths = map{( defined $fmt_info{$_.'Z'} ? $fmt_info{$_.'Z'} : "" )} @alleles;
-    }
     # Handle VCF lines from the Ion Torrent Suite where ALT depths are in AO and REF depths are in RO
     elsif( !defined $fmt_info{AD} and defined $fmt_info{AO} and defined $fmt_info{RO} ) {
         @depths = ( $fmt_info{RO}, map{( m/^\d+$/ ? $_ : "" )}split( /,/, $fmt_info{AO} ));
-    }
-    # Handle VCF lines from Delly where REF/ALT SV junction read counts are in RR/RV respectively
-    elsif( !defined $fmt_info{AD} and defined $fmt_info{RR} and defined $fmt_info{RV} ) {
-        # Reference allele depth and depths for any other ALT alleles must be left undefined
-        @depths = map{""} @alleles;
-        $depths[0] = $fmt_info{RR};
-        $depths[$var_allele_idx] = $fmt_info{RV};
-    }
-    # Handle VCF lines from cgpPindel, where ALT depth and total depth are in PP:NP:PR:NR
-    elsif( !defined $fmt_info{AD} and scalar( grep{defined $fmt_info{$_}} qw/PP NP PR NR/ ) == 4 ) {
-        # Reference allele depth and depths for any other ALT alleles must be left undefined
-        @depths = map{""} @alleles;
-        $depths[$var_allele_idx] = $fmt_info{PP} + $fmt_info{NP};
-        $fmt_info{DP} = $fmt_info{PR} + $fmt_info{NR};
     }
     # Handle VCF lines with ALT allele fraction in FA, which needs to be multiplied by DP to get AD
     elsif( !defined $fmt_info{AD} and defined $fmt_info{FA} and defined $fmt_info{DP} and $fmt_info{DP} ne '.' ) {
@@ -1066,24 +945,24 @@ __DATA__
 =head1 OPTIONS
 
  --input-vcf      Path to input file in VCF format
- --output-maf     Path to output MAF file
+ --output-maf     Path to output MAF file [Default: STDOUT]
  --tmp-dir        Folder to retain intermediate VCFs after runtime [Default: Folder containing input VCF]
  --tumor-id       Tumor_Sample_Barcode to report in the MAF [TUMOR]
  --normal-id      Matched_Norm_Sample_Barcode to report in the MAF [NORMAL]
  --vcf-tumor-id   Tumor sample ID used in VCF's genotype columns [--tumor-id]
  --vcf-normal-id  Matched normal ID used in VCF's genotype columns [--normal-id]
  --custom-enst    List of custom ENST IDs that override canonical selection
- --vep-path       Folder containing the vep script [~/vep]
+ --vep-path       Folder containing variant_effect_predictor.pl [~/vep]
  --vep-data       VEP's base cache/plugin directory [~/.vep]
  --vep-forks      Number of forked processes to use when running VEP [4]
  --buffer-size    Number of variants VEP loads at a time; Reduce this for low memory systems [5000]
  --any-allele     When reporting co-located variants, allow mismatched variant alleles too
- --ref-fasta      Reference FASTA file [~/.vep/homo_sapiens/91_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz]
- --filter-vcf     A VCF for FILTER tag common_variant. Set to 0 to disable [~/.vep/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz]
+ --ref-fasta      Reference FASTA file [~/.vep/homo_sapiens/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz]
+ --filter-vcf     The non-TCGA VCF from exac.broadinstitute.org [~/.vep/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz]
  --max-filter-ac  Use tag common_variant if the filter-vcf reports a subpopulation AC higher than this [10]
  --species        Ensembl-friendly name of species (e.g. mus_musculus for mouse) [homo_sapiens]
  --ncbi-build     NCBI reference assembly of variants MAF (e.g. GRCm38 for mouse) [GRCh37]
- --cache-version  Version of offline cache to use with VEP (e.g. 75, 84, 91) [Default: Installed version]
+ --cache-version  Version of offline cache to use with VEP (e.g. 75, 82, 86) [Default: Installed version]
  --maf-center     Variant calling center to report in MAF [.]
  --retain-info    Comma-delimited names of INFO fields to retain as extra columns in MAF []
  --min-hom-vaf    If GT undefined in VCF, minimum allele fraction to call a variant homozygous [0.7]

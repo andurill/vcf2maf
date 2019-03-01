@@ -8,13 +8,19 @@ use IO::File;
 use Getopt::Long qw( GetOptions );
 use Pod::Usage qw( pod2usage );
 
+
 # Set any default paths and constants
-my $ref_fasta = "$ENV{HOME}/.vep/homo_sapiens/91_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz";
+my $ref_fasta = "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/homo_sapiens_merged/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz";
 my ( $tum_depth_col, $tum_rad_col, $tum_vad_col ) = qw( t_depth t_ref_count t_alt_count );
 my ( $nrm_depth_col, $nrm_rad_col, $nrm_vad_col ) = qw( n_depth n_ref_count n_alt_count );
 
 # Find out if samtools is properly installed, and warn the user if it's not
-my ( $samtools ) = map{chomp; $_}`which samtools`;
+#my ( $samtools ) = map{chomp; $_}`which samtools`;
+#( $samtools and -e $samtools ) or die "ERROR: Please install samtools, and make sure it's in your PATH\n";
+
+my $samtools = ( -e "/opt/bin/samtools" ? "/opt/bin/samtools" : "/dmp/resources/prod/tools/bio/samtools/production/samtools" );
+$samtools = `which samtools` unless( -e $samtools );
+chomp( $samtools );
 ( $samtools and -e $samtools ) or die "ERROR: Please install samtools, and make sure it's in your PATH\n";
 
 # Check for missing or crappy arguments
@@ -53,11 +59,8 @@ unless( defined $output_vcf ) {
 
 # Before anything, let's parse the headers of this supposed "MAF-like" file and do some checks
 my $maf_fh = IO::File->new( $input_maf ) or die "ERROR: Couldn't open input MAF: $input_maf!\n";
-my ( %uniq_regions, %filter_tags, %flanking_bps, @tn_pair, %col_idx, $header_line );
+my ( %uniq_regions, %flanking_bps, @tn_pair, %col_idx, $header_line );
 while( my $line = $maf_fh->getline ) {
-
-    # If the file uses Mac OS 9 newlines, quit with an error
-    ( $line !~ m/\r$/ ) or die "ERROR: Your MAF uses CR line breaks, which we can't support. Please use LF or CRLF.\n";
 
     # Skip comment lines
     next if( $line =~ m/^#/ );
@@ -78,7 +81,7 @@ while( my $line = $maf_fh->getline ) {
         # Fetch all tumor-normal paired IDs from the MAF, doing some whitespace cleanup in the same step
         my $tn_idx = $col_idx{tumor_sample_barcode} + 1;
         $tn_idx .= ( "," . ( $col_idx{matched_norm_sample_barcode} + 1 )) if( defined $col_idx{matched_norm_sample_barcode} );
-        @tn_pair = map{s/^\s+|\s+$|\r|\n//g; s/\s*\t\s*/\t/; $_}`grep -aEiv "^#|^Hugo_Symbol|^Chromosome|^Tumor_Sample_Barcode" $input_maf | cut -f $tn_idx | sort -u`;
+        @tn_pair = map{s/^\s+|\s+$|\r|\n//g; s/\s*\t\s*/\t/; $_}`grep -Eiv "^#|^Hugo_Symbol|^Chromosome|^Tumor_Sample_Barcode" $input_maf | cut -f $tn_idx | sort -u`;
 
         # Quit if one of the TN barcodes are missing, or they contain characters not allowed in Unix filenames
         map{ ( !m/^\s*$|^#|\0|\// ) or die "ERROR: Invalid Tumor_Sample_Barcode in MAF: \"$_\"\n"} @tn_pair;
@@ -89,12 +92,10 @@ while( my $line = $maf_fh->getline ) {
     ( %col_idx ) or die "ERROR: Couldn't find a header line (must start with Hugo_Symbol, Chromosome, or Tumor_Sample_Barcode): $input_maf\n";
 
     # For each variant in the MAF, parse out the locus for running samtools faidx later
-    my ( $chr, $pos, $ref, $filter ) = map{ my $c = lc; ( defined $col_idx{$c} ? $cols[$col_idx{$c}] : "" )} qw( Chromosome Start_Position Reference_Allele FILTER );
+    my ( $chr, $pos, $ref ) = map{ my $c = lc; ( defined $col_idx{$c} ? $cols[$col_idx{$c}] : "" )} qw( Chromosome Start_Position Reference_Allele );
     $ref =~ s/^(\?|-|0)+$//; # Blank out the dashes (or other weird chars) used with indels
     my $region = "$chr:" . ( $pos - 1 ) . "-" . ( $pos + length( $ref ));
     $uniq_regions{$region} = 1;
-    # Also track the unique FILTER tags seen, so we can construct VCF header lines for each
-    map{ $filter_tags{$_} = 1 unless( $_ eq "PASS" or $_ eq "." )} split( /,|;/, $filter );
 }
 $maf_fh->close;
 
@@ -116,12 +117,6 @@ foreach my $line ( grep( length, split( ">", $lines ))) {
 
 # If flanking_bps is entirely empty, then it's most likely that the user chose the wrong ref-fasta
 ( %flanking_bps ) or die "ERROR: Make sure that ref-fasta is the same genome build as your MAF: $ref_fasta\n";
-
-# Create VCF header lines for the reference FASTA, its contigs, and their lengths
-my $ref_fai = $ref_fasta . ".fai";
-`$samtools faidx $ref_fasta` unless( -s $ref_fai );
-my @ref_contigs = map { chomp; my ($chr, $len)=split("\t"); "##contig=<ID=$chr,length=$len>\n" } `cut -f1,2 $ref_fai | sort -k1,1V`;
-my $ref_header = "##reference=file://$ref_fasta\n" . join( "", @ref_contigs );
 
 # Parse through each variant in the MAF, and fill up the respective per-sample VCFs
 $maf_fh = IO::File->new( $input_maf ) or die "ERROR: Couldn't open file: $input_maf\n";
@@ -157,11 +152,9 @@ while( my $line = $maf_fh->getline ) {
             if( $per_tn_vcfs ) {
                 my $vcf_file = "$output_dir/$t_id\_vs_$n_id.vcf";
                 $tn_vcf{$vcf_file} .= "##fileformat=VCFv4.2\n";
-                $tn_vcf{$vcf_file} .= $ref_header;
                 $tn_vcf{$vcf_file} .= "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n";
-                $tn_vcf{$vcf_file} .= "##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Allelic depths of REF and ALT(s) in the order listed\">\n";
+                $tn_vcf{$vcf_file} .= "##FORMAT=<ID=AD,Number=G,Type=Integer,Description=\"Allelic depths of REF and ALT(s) in the order listed\">\n";
                 $tn_vcf{$vcf_file} .= "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Total read depth across this site\">\n";
-                $tn_vcf{$vcf_file} .= "##FILTER=<ID=$_,Description=\"\">\n" foreach ( sort keys %filter_tags );
                 $tn_vcf{$vcf_file} .= "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t$t_id\t$n_id\n";
             }
 
@@ -208,13 +201,8 @@ while( my $line = $maf_fh->getline ) {
     $al1 = $ref if( $al1 eq "" );
     $al2 = $ref if( $al2 eq "" );
 
-    # When variant alleles are a SNP and a "-", warn user of misusing "-" to denote REF
-    if( $al1 ne $ref and $al2 ne $ref and $al1 ne $al2 and ( $al1 eq "-" or $al2 eq "-" ) and
-        length( $al1 ) == 1 and length( $al2 ) == 1 and length( $ref ) == 1 ) {
-        $al1 = $ref if( $al1 eq "-" );
-        $al2 = $ref if( $al2 eq "-" );
-        warn "WARNING: Replacing '-' with reference allele in: $line";
-    }
+    # Handle a case when $al1 is a SNP we want to annotate, but $al2 is incorrectly "-"
+    ( $al1, $al2 ) = ( $al2, $al1 ) if( $al2 eq "-" );
 
     # Blank out the dashes (or other weird chars) used with indels
     ( $ref, $al1, $al2, $n_al1, $n_al2 ) = map{s/^(\?|-|0)+$//; $_} ( $ref, $al1, $al2, $n_al1, $n_al2 );
@@ -268,8 +256,7 @@ while( my $line = $maf_fh->getline ) {
     # Set tumor and normal genotypes (FORMAT tag GT in VCF)
     my ( $t_gt, $n_gt ) = ( "0/1", "0/0" ); # Set defaults
     $t_gt = join( "/", $al_idx{$al2}, $al_idx{$al1} ) if( $al_idx{$al1} ne "0" );
-    $n_gt = join( "/", $al_idx{$n_al2}, $al_idx{$n_al1} ) if( $al_idx{$n_al1} ne "0" );
-    $n_gt = join( "/", $al_idx{$n_al1}, $al_idx{$n_al2} ) if( $al_idx{$n_al2} ne "0" );
+    $n_gt = join( "/", $al_idx{$n_al2}, $al_idx{$n_al1} ) if( $al_idx{$n_al1} ne "0" or $al_idx{$n_al2} ne "0" );
 
     # Create the VCF's comma-delimited ALT field that must list all non-REF (variant) alleles
     my $alt = join( ",", @alleles[1..$#alleles] );
@@ -317,11 +304,9 @@ if( $per_tn_vcfs ) {
 my @vcf_cols = sort { $vcf_col_idx{$a} <=> $vcf_col_idx{$b} } keys %vcf_col_idx;
 my $vcf_fh = IO::File->new( $output_vcf, ">" ) or die "ERROR: Fail to create file $output_vcf\n";
 $vcf_fh->print( "##fileformat=VCFv4.2\n" );
-$vcf_fh->print( $ref_header );
 $vcf_fh->print( "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n" );
-$vcf_fh->print( "##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Allelic Depths of REF and ALT(s) in the order listed\">\n" );
+$vcf_fh->print( "##FORMAT=<ID=AD,Number=G,Type=Integer,Description=\"Allelic Depths of REF and ALT(s) in the order listed\">\n" );
 $vcf_fh->print( "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">\n" );
-$vcf_fh->print( "##FILTER=<ID=$_,Description=\"\">\n" ) foreach ( sort keys %filter_tags );
 $vcf_fh->print( "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" . join("\t", @vcf_cols) . "\n" );
 
 # Write each variant into the multi-sample VCF
@@ -352,7 +337,7 @@ __DATA__
  --input-maf      Path to input file in MAF format
  --output-dir     Path to output directory where VCFs will be stored, one per TN-pair
  --output-vcf     Path to output multi-sample VCF containing all TN-pairs [<output-dir>/<input-maf-name>.vcf]
- --ref-fasta      Path to reference Fasta file [~/.vep/homo_sapiens/91_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz]
+ --ref-fasta      Path to reference Fasta file [~/.vep/homo_sapiens/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz]
  --per-tn-vcfs    Specify this to generate VCFs per-TN pair, in addition to the multi-sample VCF
  --tum-depth-col  Name of MAF column for read depth in tumor BAM [t_depth]
  --tum-rad-col    Name of MAF column for reference allele depth in tumor BAM [t_ref_count]

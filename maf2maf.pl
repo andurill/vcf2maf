@@ -12,13 +12,14 @@ use File::Copy qw( move );
 use File::Path qw( mkpath );
 use Config;
 
+
 # Set any default paths and constants
 my ( $tum_depth_col, $tum_rad_col, $tum_vad_col ) = qw( t_depth t_ref_count t_alt_count );
 my ( $nrm_depth_col, $nrm_rad_col, $nrm_vad_col ) = qw( n_depth n_ref_count n_alt_count );
-my ( $vep_path, $vep_data, $vep_forks, $buffer_size, $any_allele ) = ( "$ENV{HOME}/vep", "$ENV{HOME}/.vep", 4, 5000, 0 );
-my ( $ref_fasta, $filter_vcf ) = ( "$ENV{HOME}/.vep/homo_sapiens/91_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz", "$ENV{HOME}/.vep/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" );
-my ( $species, $ncbi_build, $cache_version, $maf_center, $max_filter_ac ) = ( "homo_sapiens", "GRCh37", "", ".", 10 );
-my $perl_bin = $Config{perlpath};
+my ( $vep_path, $vep_data, $vep_forks, $buffer_size, $any_allele ) = ( "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86", 10, 10000, 0 );
+my ( $ref_fasta, $filter_vcf ) = ( "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/homo_sapiens_merged/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" );
+my ( $species, $ncbi_build, $cache_version, $maf_center, $min_hom_vaf, $max_filter_ac ) = ( "homo_sapiens_merged", "GRCh37", "", ".", 0.7, 10 );
+my $perl_bin = "/dmp/resources/prod/tools/system/perl/bin/perl";
 
 # Columns that can be safely borrowed from the input MAF
 my $retain_cols = "Center,Verification_Status,Validation_Status,Mutation_Status,Sequencing_Phase" .
@@ -35,14 +36,13 @@ my %force_new_cols = map{ my $c = lc; ( $c, 1 )} qw( Hugo_Symbol Entrez_Gene_Id 
     t_ref_count t_alt_count n_depth n_ref_count n_alt_count all_effects Allele Gene Feature
     Feature_type Consequence cDNA_position CDS_position Protein_position Amino_acids Codons
     Existing_variation ALLELE_NUM DISTANCE STRAND_VEP SYMBOL SYMBOL_SOURCE HGNC_ID BIOTYPE CANONICAL
-    CCDS ENSP SWISSPROT TREMBL UNIPARC RefSeq SIFT PolyPhen EXON INTRON DOMAINS AF AFR_AF
-    AMR_AF ASN_AF EAS_AF EUR_AF SAS_AF AA_AF EA_AF CLIN_SIG SOMATIC PUBMED MOTIF_NAME
+    CCDS ENSP SWISSPROT TREMBL UNIPARC RefSeq SIFT PolyPhen EXON INTRON DOMAINS GMAF AFR_MAF
+    AMR_MAF ASN_MAF EAS_MAF EUR_MAF SAS_MAF AA_MAF EA_MAF CLIN_SIG SOMATIC PUBMED MOTIF_NAME
     MOTIF_POS HIGH_INF_POS MOTIF_SCORE_CHANGE IMPACT PICK VARIANT_CLASS TSL HGVS_OFFSET PHENO
     MINIMISED ExAC_AF ExAC_AF_AFR ExAC_AF_AMR ExAC_AF_EAS ExAC_AF_FIN ExAC_AF_NFE ExAC_AF_OTH
     ExAC_AF_SAS GENE_PHENO FILTER flanking_bps variant_id variant_qual ExAC_AF_Adj ExAC_AC_AN_Adj
     ExAC_AC_AN ExAC_AC_AN_AFR ExAC_AC_AN_AMR ExAC_AC_AN_EAS ExAC_AC_AN_FIN ExAC_AC_AN_NFE
-    ExAC_AC_AN_OTH ExAC_AC_AN_SAS ExAC_FILTER gnomAD_AF gnomAD_AFR_AF gnomAD_AMR_AF gnomAD_ASJ_AF
-    gnomAD_EAS_AF gnomAD_FIN_AF gnomAD_NFE_AF gnomAD_OTH_AF gnomAD_SAS_AF );
+    ExAC_AC_AN_OTH ExAC_AC_AN_SAS ExAC_FILTER );
 
 # Check for missing or crappy arguments
 unless( @ARGV and $ARGV[0]=~m/^-/ ) {
@@ -120,23 +120,19 @@ if( -s $vep_anno ) {
 }
 else {
     warn "STATUS: Running VEP and writing to: $vep_anno\n";
-    # Make sure we can find the VEP script
-    my $vep_script = ( -s "$vep_path/vep" ? "$vep_path/vep" : "$vep_path/variant_effect_predictor.pl" );
-    ( -s $vep_script ) or die "ERROR: Cannot find VEP script in path: $vep_path\n";
+    # Make sure we can find the VEP script and the reference FASTA
+    ( -s "$vep_path/variant_effect_predictor.pl" ) or die "ERROR: Cannot find VEP script variant_effect_predictor.pl in path: $vep_path\n";
 
     # Contruct VEP command using some default options and run it
-    my $vep_cmd = "$perl_bin $vep_script --species $species --assembly $ncbi_build --offline --no_progress --no_stats --buffer_size $buffer_size --sift b --ccds --uniprot --hgvs --symbol --numbers --domains --gene_phenotype --canonical --protein --biotype --uniprot --tsl --pubmed --variant_class --shift_hgvs 1 --check_existing --total_length --allele_number --no_escape --xref_refseq --failed 1 --vcf --flag_pick_allele --pick_order canonical,tsl,biotype,rank,ccds,length --dir $vep_data --fasta $ref_fasta --format vcf --input_file $vcf_file --output_file $vep_anno";
+    my $vep_cmd = "$perl_bin $vep_path/variant_effect_predictor.pl --species $species --assembly $ncbi_build --offline --no_progress --no_stats --buffer_size $buffer_size --sift b --ccds --uniprot --hgvs --symbol --numbers --domains --gene_phenotype --canonical --protein --biotype --uniprot --tsl --pubmed --variant_class --shift_hgvs 1 --check_existing --total_length --allele_number --no_escape --xref_refseq --failed 1 --vcf --minimal --flag_pick_allele --pick_order canonical,tsl,biotype,rank,ccds,length --dir $vep_data --fasta $ref_fasta --format vcf --input_file $vcf_file --output_file $vep_anno";
     # VEP barks if --fork is set to 1. So don't use this argument unless it's >1
     $vep_cmd .= " --fork $vep_forks" if( $vep_forks > 1 );
-    # Require allele match for co-located variants unless user-rejected or we're using a newer VEP
-    $vep_cmd .= " --check_allele" unless( $any_allele or $vep_script =~ m/vep$/ );
+    # Unless user says otherwise, require VEP to match alleles when reporting co-located variants
+    $vep_cmd .= " --check_allele" unless( $any_allele );
     # Add --cache-version only if the user specifically asked for a version
     $vep_cmd .= " --cache_version $cache_version" if( $cache_version );
     # Add options that only work on human variants
-    if( $species eq "homo_sapiens" ) {
-        # Slight change in these arguments if using the newer VEP
-        $vep_cmd .= " --polyphen b " . ( $vep_script =~ m/vep$/ ? "--af --af_1kg --af_esp --af_gnomad" : "--gmaf --maf_1kg --maf_esp" );
-    }
+    $vep_cmd .= " --polyphen b --gmaf --maf_1kg --maf_esp" if( $species eq "homo_sapiens" );
     # Add options that work for most species, except a few
     $vep_cmd .= " --regulatory" unless( $species eq "canis_familiaris" );
 
@@ -272,8 +268,7 @@ if( $retain_cols ) {
         else {
             # Extract minimal variant info, and figure out which of the tumor alleles is non-REF
             my ( $chr, $pos, $ref, $al1, $al2, $sample_id ) = map{ my $c = lc; ( defined $input_maf_col_idx{$c} ? $cols[$input_maf_col_idx{$c}] : "" ) } qw( Chromosome Start_Position Reference_Allele Tumor_Seq_Allele1 Tumor_Seq_Allele2 Tumor_Sample_Barcode );
-            # Prefer Tumor_Seq_Allele2 over Tumor_Seq_Allele1 if both are non-REF
-            my $var = (( defined $al2 and $al2 and $al2 ne $ref ) ? $al2 : $al1 );
+            my $var = (( defined $al1 and $al1 and $al1 ne $ref ) ? $al1 : $al2 );
 
             # Remove any prefixed reference bps from alleles, using "-" for simple indels
             while( $ref and $var and substr( $ref, 0, 1 ) eq substr( $var, 0, 1 ) and $ref ne $var ) {
@@ -283,10 +278,10 @@ if( $retain_cols ) {
 
             # Create a key for this variant using Chromosome:Start_Position:Tumor_Sample_Barcode:Reference_Allele:Variant_Allele
             my $key = join( ":", $chr, $pos, $sample_id, $ref, $var );
-            %{$input_maf_data{$key}} = ();
 
             # Store values for this variant into a hash, adding column names to the key
             foreach my $c ( map{lc} split( ",", $retain_cols )) {
+                $input_maf_data{$key}{$c} = "";
                 if( defined $input_maf_col_idx{$c} and defined $cols[$input_maf_col_idx{$c}] ) {
                     $input_maf_data{$key}{$c} = $cols[$input_maf_col_idx{$c}];
                 }
@@ -325,7 +320,7 @@ if( $retain_cols ) {
                 my $key = join( ":", map{ my $c = lc; $cols[$output_maf_col_idx{$c}] } qw( Chromosome Start_Position Tumor_Sample_Barcode Reference_Allele Tumor_Seq_Allele2 ));
                 foreach my $c ( map{lc} split( /\t/, $maf_header )){
                     if( !$force_new_cols{$c} ) {
-                        $cols[$output_maf_col_idx{$c}] = $input_maf_data{$key}{$c} if( defined $input_maf_data{$key}{$c} );
+                        $cols[$output_maf_col_idx{$c}] = ( defined $input_maf_data{$key}{$c} ? $input_maf_data{$key}{$c} : "" );
                     }
                 }
                 $tmp_tn_maf_fh->print( join( "\t", @cols ) . "\n" );
@@ -376,17 +371,17 @@ __DATA__
  --nrm-vad-col    Name of MAF column for variant allele depth in normal BAM [n_alt_count]
  --retain-cols    Comma-delimited list of columns to retain from the input MAF [Center,Verification_Status,Validation_Status,Mutation_Status,Sequencing_Phase,Sequence_Source,Validation_Method,Score,BAM_file,Sequencer,Tumor_Sample_UUID,Matched_Norm_Sample_UUID]
  --custom-enst    List of custom ENST IDs that override canonical selection
- --vep-path       Folder containing the vep script [~/vep]
+ --vep-path       Folder containing variant_effect_predictor.pl [~/vep]
  --vep-data       VEP's base cache/plugin directory [~/.vep]
  --vep-forks      Number of forked processes to use when running VEP [4]
  --buffer-size    Number of variants VEP loads at a time; Reduce this for low memory systems [5000]
  --any-allele     When reporting co-located variants, allow mismatched variant alleles too
- --filter-vcf     A VCF for FILTER tag common_variant. Set to 0 to disable [~/.vep/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz]
+ --filter-vcf     The non-TCGA VCF from exac.broadinstitute.org [~/.vep/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz]
  --max-filter-ac  Use tag common_variant if the filter-vcf reports a subpopulation AC higher than this [10]
  --species        Ensembl-friendly name of species (e.g. mus_musculus for mouse) [homo_sapiens]
  --ncbi-build     NCBI reference assembly of variants in MAF (e.g. GRCm38 for mouse) [GRCh37]
- --cache-version  Version of offline cache to use with VEP (e.g. 75, 84, 91) [Default: Installed version]
- --ref-fasta      Reference FASTA file [~/.vep/homo_sapiens/91_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz]
+ --cache-version  Version of offline cache to use with VEP (e.g. 75, 82, 86) [Default: Installed version]
+ --ref-fasta      Reference FASTA file [~/.vep/homo_sapiens/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz]
  --help           Print a brief help message and quit
  --man            Print the detailed manual
 
