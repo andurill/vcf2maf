@@ -13,14 +13,19 @@ use Config;
 
 # Set any default paths and constants
 my ( $tumor_id, $normal_id ) = ( "TUMOR", "NORMAL" );
-my ( $vep_path, $vep_data, $vep_forks, $buffer_size, $any_allele ) = ( "$ENV{HOME}/vep", "$ENV{HOME}/.vep", 4, 5000, 0 );
-my ( $ref_fasta, $filter_vcf ) = ( "$ENV{HOME}/.vep/homo_sapiens/91_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz", "$ENV{HOME}/.vep/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" );
-my ( $species, $ncbi_build, $cache_version, $maf_center, $retain_info, $min_hom_vaf, $max_filter_ac ) = ( "homo_sapiens", "GRCh37", "", ".", "", 0.7, 10 );
-my $perl_bin = $Config{perlpath};
+my ( $vep_path, $vep_data, $vep_forks, $buffer_size, $any_allele ) = ( "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86", 10, 10000, 0 );
+my ( $ref_fasta, $filter_vcf ) = ( "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/homo_sapiens_merged/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" );
+my ( $species, $ncbi_build, $cache_version, $maf_center, $retain_info, $min_hom_vaf, $max_filter_ac ) = ( "homo_sapiens_merged", "GRCh37", "", ".", "", 0.7, 10 );
+my $perl_bin = "/dmp/resources/prod/tools/system/perl/bin/perl";
 
 # Find out if samtools and tabix are properly installed, and warn the user if it's not
-my ( $samtools ) = map{chomp; $_}`which samtools`;
+#my ( $samtools ) = map{chomp; $_}`which samtools`;
+#( $samtools and -e $samtools ) or die "ERROR: Please install samtools, and make sure it's in your PATH\n";
+my $samtools = ( -e "/opt/bin/samtools" ? "/opt/bin/samtools" : "/dmp/resources/prod/tools/bio/samtools/production/samtools" );
+$samtools = `which samtools` unless( -e $samtools );
+chomp( $samtools );
 ( $samtools and -e $samtools ) or die "ERROR: Please install samtools, and make sure it's in your PATH\n";
+
 my ( $tabix ) = map{chomp; $_}`which tabix`;
 ( $tabix and -e $tabix ) or die "ERROR: Please install tabix, and make sure it's in your PATH\n";
 
@@ -341,7 +346,7 @@ if( $remap_chain ) {
 }
 
 # Before running annotation, let's pull flanking reference bps for each variant to do some checks,
-# and we'll also pull out overlapping calls from the filter VCF
+# and we'll also pull out overlapping calls from the filter VCFf
 my $vcf_fh = IO::File->new( $input_vcf ) or die "ERROR: Couldn't open --input-vcf: $input_vcf!\n";
 my ( %ref_bps, @ref_regions, %uniq_loci, %uniq_regions, %flanking_bps, %filter_data );
 while( my $line = $vcf_fh->getline ) {
@@ -687,7 +692,7 @@ while( my $line = $annotated_vcf_fh->getline ) {
             if( defined $effect{HGVSp_Short} and $effect{HGVSp_Short} eq "p.=" ) {
                 my ( $p_pos ) = $effect{Protein_position} =~ m/^(\d+)(-\d+)?\/\d+$/;
                 my $aa = $effect{Amino_acids};
-                $effect{HGVSp_Short} = "p.$aa" . $p_pos . "=";
+                $effect{HGVSp_Short} = "p.$aa" . $p_pos . $aa;
             }
 
             # Copy VEP data into MAF fields that don't share the same identifier
@@ -724,20 +729,28 @@ while( my $line = $annotated_vcf_fh->getline ) {
             $b->{Transcript_Length} <=> $a->{Transcript_Length}
         } @all_effects;
 
-        # Find the highest priority effect with a gene symbol (usually the first one)
-        my ( $effect_with_gene_name ) = grep { $_->{SYMBOL} } @all_effects;
-        my $maf_gene = $effect_with_gene_name->{SYMBOL} if( $effect_with_gene_name );
-
-        # If the gene has user-defined custom isoform overrides, choose that instead
+ 
+	    # Find the highest priority effect with a gene symbol (usually the first one)
+	    my ( $effect_with_gene_name ) = grep { $_->{SYMBOL} } @all_effects;
+	    my $maf_gene = $effect_with_gene_name->{SYMBOL} if( $effect_with_gene_name );
+	    if (defined $maf_gene){ #RNP fix for overlapping transcripts
+        	if ($maf_gene eq "BIVM-ERCC5"){ $maf_gene = "ERCC5";}
+		    elsif ($maf_gene eq "MEF2BNB-MEF2B"){ $maf_gene = "MEF2B";}
+	    }
+ 
+        # If that gene has a user-preferred isoform, report the effect on that isoform
         ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{SYMBOL} eq $maf_gene and $_->{Transcript_ID} and $custom_enst{$_->{Transcript_ID}} } @all_effects;
 
-        # Find the effect on the canonical transcript of that highest priority gene
+        # If that gene has no user-preferred isoform, then use the VEP-preferred (canonical) isoform
         ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{SYMBOL} eq $maf_gene and $_->{CANONICAL} and $_->{CANONICAL} eq "YES" } @all_effects unless( $maf_effect );
 
-        # If that gene has no canonical transcript tagged, choose the highest priority canonical effect on any gene
-        ( $maf_effect ) = grep { $_->{CANONICAL} and $_->{CANONICAL} eq "YES" } @all_effects unless( $maf_effect );
+        # If that gene has no VEP-preferred isoform either, then choose the worst affected user-preferred isoform with a gene symbol
+        ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{Transcript_ID} and $custom_enst{$_->{Transcript_ID}} } @all_effects unless( $maf_effect );
 
-        # If none of the effects are tagged as canonical, then just report the top priority effect
+        # If none of the isoforms are user-preferred, then choose the worst affected VEP-preferred isoform with a gene symbol
+        ( $maf_effect ) = grep { $_->{SYMBOL} and $_->{CANONICAL} and $_->{CANONICAL} eq "YES" } @all_effects unless( $maf_effect );
+
+        # If we still have nothing selected, then just report the worst effect
         $maf_effect = $all_effects[0] unless( $maf_effect );
     }
 
@@ -790,10 +803,15 @@ while( my $line = $annotated_vcf_fh->getline ) {
     foreach my $effect ( @all_effects ) {
         my $gene_name = $effect->{Hugo_Symbol};
         my $effect_type = $effect->{One_Consequence};
-        my $protein_change = ( $effect->{HGVSp} ? $effect->{HGVSp} : '' );
-        my $transcript_id = ( $effect->{Transcript_ID} ? $effect->{Transcript_ID} : '' );
+        my $cDNA_change  = ( $effect->{HGVSc} ? $effect->{HGVSc} : '' );
+	    my $protein_change_long = ( $effect->{HGVSp} ? $effect->{HGVSp} : '' );
+  	    my $protein_change = ( $effect->{HGVSp_Short} ? $effect->{HGVSp_Short} : '' );
+ 	    my $transcript_id = ( $effect->{Transcript_ID} ? $effect->{Transcript_ID} : '' );
         my $refseq_ids = ( $effect->{RefSeq} ? $effect->{RefSeq} : '' );
-        $maf_line{all_effects} .= "$gene_name,$effect_type,$protein_change,$transcript_id,$refseq_ids;" if( $effect_type and $transcript_id );
+       # $maf_line{all_effects} .= "$gene_name,$effect_type,$protein_change,$transcript_id,$refseq_ids;" if( $gene_name and $effect_type and $transcript_id );
+	    my $exon_number = $effect->{Exon_Number}; #ADDED
+        $maf_line{all_effects} .= "$gene_name,$effect_type,$cDNA_change,$protein_change,$transcript_id,$refseq_ids,$exon_number,$protein_change_long;" if( $gene_name and $effect_type and $transcript_id );
+
     }
 
     # If this variant was seen in the ExAC VCF, let's report allele counts and frequencies

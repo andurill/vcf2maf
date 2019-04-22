@@ -8,13 +8,19 @@ use IO::File;
 use Getopt::Long qw( GetOptions );
 use Pod::Usage qw( pod2usage );
 
+
 # Set any default paths and constants
-my $ref_fasta = "$ENV{HOME}/.vep/homo_sapiens/91_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz";
+my $ref_fasta = "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/homo_sapiens_merged/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz";
 my ( $tum_depth_col, $tum_rad_col, $tum_vad_col ) = qw( t_depth t_ref_count t_alt_count );
 my ( $nrm_depth_col, $nrm_rad_col, $nrm_vad_col ) = qw( n_depth n_ref_count n_alt_count );
 
 # Find out if samtools is properly installed, and warn the user if it's not
-my ( $samtools ) = map{chomp; $_}`which samtools`;
+#my ( $samtools ) = map{chomp; $_}`which samtools`;
+#( $samtools and -e $samtools ) or die "ERROR: Please install samtools, and make sure it's in your PATH\n";
+
+my $samtools = ( -e "/opt/bin/samtools" ? "/opt/bin/samtools" : "/dmp/resources/prod/tools/bio/samtools/production/samtools" );
+$samtools = `which samtools` unless( -e $samtools );
+chomp( $samtools );
 ( $samtools and -e $samtools ) or die "ERROR: Please install samtools, and make sure it's in your PATH\n";
 
 # Check for missing or crappy arguments

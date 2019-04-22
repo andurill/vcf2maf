@@ -42,7 +42,7 @@ unless( @ARGV and $ARGV[0] =~ m/^-/ ) {
 # Parse options and print usage if there is a syntax error, or if usage was explicitly requested
 my ( $man, $help, $add_filters ) = ( 0, 0, 0 );
 my ( $input_vcf, $output_vcf, $new_tumor_id, $new_normal_id, $remap_chain );
-my ( $tumor_bam, $normal_bam, $ref_fasta ) = ( "", "", "$ENV{HOME}/.vep/homo_sapiens/91_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz" );
+my ( $tumor_bam, $normal_bam, $ref_fasta ) = ( "", "", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/homo_sapiens_merged/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz" ); ##########################################
 GetOptions(
     'help!' => \$help,
     'man!' => \$man,

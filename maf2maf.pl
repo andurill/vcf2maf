@@ -12,13 +12,14 @@ use File::Copy qw( move );
 use File::Path qw( mkpath );
 use Config;
 
+
 # Set any default paths and constants
 my ( $tum_depth_col, $tum_rad_col, $tum_vad_col ) = qw( t_depth t_ref_count t_alt_count );
 my ( $nrm_depth_col, $nrm_rad_col, $nrm_vad_col ) = qw( n_depth n_ref_count n_alt_count );
-my ( $vep_path, $vep_data, $vep_forks, $buffer_size, $any_allele ) = ( "$ENV{HOME}/vep", "$ENV{HOME}/.vep", 4, 5000, 0 );
-my ( $ref_fasta, $filter_vcf ) = ( "$ENV{HOME}/.vep/homo_sapiens/91_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa.gz", "$ENV{HOME}/.vep/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" );
-my ( $species, $ncbi_build, $cache_version, $maf_center, $max_filter_ac ) = ( "homo_sapiens", "GRCh37", "", ".", 10 );
-my $perl_bin = $Config{perlpath};
+my ( $vep_path, $vep_data, $vep_forks, $buffer_size, $any_allele ) = ( "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86", 10, 10000, 0 );
+my ( $ref_fasta, $filter_vcf ) = ( "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/homo_sapiens_merged/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" );
+my ( $species, $ncbi_build, $cache_version, $maf_center, $min_hom_vaf, $max_filter_ac ) = ( "homo_sapiens_merged", "GRCh37", "", ".", 0.7, 10 );
+my $perl_bin = "/dmp/resources/prod/tools/system/perl/bin/perl";
 
 # Columns that can be safely borrowed from the input MAF
 my $retain_cols = "Center,Verification_Status,Validation_Status,Mutation_Status,Sequencing_Phase" .
