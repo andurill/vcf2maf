@@ -9,7 +9,6 @@ use Getopt::Long qw( GetOptions );
 use Pod::Usage qw( pod2usage );
 use File::Path qw( mkpath );
 use Config;
-use Data::Dumper;
 
 # Set any default paths and constants
 my ( $tumor_id, $normal_id ) = ( "TUMOR", "NORMAL" );
