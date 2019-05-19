@@ -9,11 +9,15 @@ use Getopt::Long qw( GetOptions );
 use Pod::Usage qw( pod2usage );
 use File::Path qw( mkpath );
 use Config;
+use Data::Dumper;
 
 # Set any default paths and constants
 my ( $tumor_id, $normal_id ) = ( "TUMOR", "NORMAL" );
 my ( $vep_path, $vep_data, $vep_forks, $buffer_size, $any_allele ) = ( "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86", 10, 10000, 0 );
 my ( $ref_fasta, $filter_vcf ) = ( "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/homo_sapiens_merged/86_GRCh37/Homo_sapiens.GRCh37.75.dna.primary_assembly.fa", "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/ExAC_nonTCGA.r0.3.1.sites.vep.vcf.gz" );
+my $gnomad_data = "/dmp/resources/prod/tools/bio/vep/VERSIONS/variant_effect_predictor_v86/gnomad.exomes.r2.1.1.sites.vcf.bgz";
+my ( $gnomad_Short_name, $gnomad_File_type, $gnomad_Annotation_type, $gnomad_Force_report_coordinates ) = ( "gnomad", "vcf", "exact", "0" );
+my $gnomad_VCF_fields = "AF,AF_afr,AF_amr,AF_asj,AF_eas,AF_fin,AF_nfe,AF_oth,AF_sas";
 my ( $species, $ncbi_build, $cache_version, $maf_center, $retain_info, $min_hom_vaf, $max_filter_ac ) = ( "homo_sapiens_merged", "GRCh37", "", ".", "", 0.7, 10 );
 my $perl_bin = "/dmp/resources/prod/tools/system/perl/bin/perl";
 
@@ -378,7 +382,6 @@ unless( -s $output_vcf ) {
     warn "STATUS: Running VEP and writing to: $output_vcf\n";
     # Make sure we can find the VEP script and the reference FASTA
     ( -s "$vep_path/variant_effect_predictor.pl" ) or die "ERROR: Cannot find VEP script variant_effect_predictor.pl in path: $vep_path\n";
-
     # Contruct VEP command using some default options and run it
     my $vep_cmd = "$perl_bin $vep_path/variant_effect_predictor.pl --species $species --assembly $ncbi_build --offline --no_progress --no_stats --buffer_size $buffer_size --sift b --ccds --uniprot --hgvs --symbol --numbers --domains --gene_phenotype --canonical --protein --biotype --uniprot --tsl --pubmed --variant_class --shift_hgvs 1 --check_existing --total_length --allele_number --no_escape --xref_refseq --failed 1 --vcf --minimal --flag_pick_allele --pick_order canonical,tsl,biotype,rank,ccds,length --dir $vep_data --fasta $ref_fasta --format vcf --input_file $input_vcf --output_file $output_vcf";
     # VEP barks if --fork is set to 1. So don't use this argument unless it's >1
@@ -391,6 +394,7 @@ unless( -s $output_vcf ) {
     $vep_cmd .= " --polyphen b --gmaf --maf_1kg --maf_esp" if( $species eq "homo_sapiens" );
     # Add options that work for most species, except a few we know about
     $vep_cmd .= " --regulatory" unless( $species eq "canis_familiaris" );
+    $vep_cmd .= " --custom " . join(',', $gnomad_data, $gnomad_Short_name, $gnomad_File_type, $gnomad_Annotation_type, $gnomad_Force_report_coordinates, $gnomad_VCF_fields) if( -e $gnomad_data and -s $gnomad_data ); 
 
     # Make sure it ran without error codes
     system( $vep_cmd ) == 0 or die "\nERROR: Failed to run the VEP annotator! Command: $vep_cmd\n";
@@ -418,7 +422,9 @@ my @ann_cols = qw( Allele Gene Feature Feature_type Consequence cDNA_position CD
     TSL HGVS_OFFSET PHENO MINIMISED ExAC_AF ExAC_AF_AFR ExAC_AF_AMR ExAC_AF_EAS ExAC_AF_FIN
     ExAC_AF_NFE ExAC_AF_OTH ExAC_AF_SAS GENE_PHENO FILTER flanking_bps variant_id variant_qual
     ExAC_AF_Adj ExAC_AC_AN_Adj ExAC_AC_AN ExAC_AC_AN_AFR ExAC_AC_AN_AMR ExAC_AC_AN_EAS
-    ExAC_AC_AN_FIN ExAC_AC_AN_NFE ExAC_AC_AN_OTH ExAC_AC_AN_SAS ExAC_FILTER );
+    ExAC_AC_AN_FIN ExAC_AC_AN_NFE ExAC_AC_AN_OTH ExAC_AC_AN_SAS ExAC_FILTER gnomAD_AF
+    gnomAD_AF_AFR gnomAD_AF_AMR gnomAD_AF_ASJ gnomAD_AF_EAS gnomAD_AF_FIN gnomAD_AF_NFE
+    gnomAD_AF_OTH gnomAD_AF_SAS );
 
 my @ann_cols_format; # To store the actual order of VEP data, that may differ between runs
 push( @maf_header, @ann_cols );
@@ -462,7 +468,6 @@ while( my $line = $annotated_vcf_fh->getline ) {
 
     chomp( $line );
     my ( $chrom, $pos, $var_id, $ref, $alt, $var_qual, $filter, $info_line, $format_line, @rest ) = split( "\t", $line );
-
     # Set ID, QUAL, and FILTER to "." unless defined and non-empty
     $var_id = "." unless( defined $var_id and $var_id ne "" );
     $var_qual = "." unless( defined $var_qual and $var_qual ne "" );
@@ -483,13 +488,12 @@ while( my $line = $annotated_vcf_fh->getline ) {
 
     # Parse out the data in the info column, and store into a hash
     my %info = map {( m/=/ ? ( split( /=/, $_, 2 )) : ( $_, "1" ))} split( /\;/, $info_line );
-
     # By default, the variant allele is the first (usually the only) allele listed under ALT
     # If there are multiple ALT alleles, choose the allele specified in the tumor GT field
     # If tumor GT is undefined or ambiguous, choose the one with the most supporting read depth
     my @alleles = ( $ref, split( /,/, $alt ));
     my $var_allele_idx = 1;
-
+    
     # Parse out info from the tumor genotype field
     my ( %tum_info, @tum_depths );
     if( defined $vcf_tumor_idx ) {
@@ -792,6 +796,16 @@ while( my $line = $annotated_vcf_fh->getline ) {
     }
     $maf_line{FILTER} = $filter;
 
+    # If this variant was seen in the gnomAD VCF provided, let's report allele counts an frequencies
+    # Given the tabix indexed gnomAD VCF, vep will automatically annotate each variant with gnomad AF, if applicable
+    # We only need to parse the INFO column to retrieve that information
+    for my $subpop ( qw( AF AF_afr AF_amr AF_asj AF_eas AF_fin AF_nfe AF_oth AF_sas )) {
+        if( exists $info{"gnomad_$subpop"} ) {
+            my $var_af = $info{"gnomad_$subpop"};
+            $maf_line{"gnomAD_".uc($subpop)} = ( $var_af ? sprintf( "%.4g", $var_af) : "" );
+        }
+    }
+    
     # Also add the reference allele flanking bps that we generated earlier with samtools
     my $region = "$chrom:" . ( $vcf_pos - 1 ) . "-" . ( $vcf_pos + length( $vcf_ref ));
     $maf_line{flanking_bps} = $flanking_bps{$region};
